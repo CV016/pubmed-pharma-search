@@ -1,74 +1,142 @@
 #!/usr/bin/env python3
 """
-PubMed Pharmaceutical/Biotech Paper Search Tool
+PubMed Pharmaceutical/Biotech Paper Search Tool - Core Module
 
-This script searches PubMed for research papers and identifies those with
-at least one author affiliated with pharmaceutical or biotech companies.
+This module provides the main functionality for searching PubMed papers
+and identifying those with pharmaceutical or biotech company affiliations.
+It includes API-based company data fetching, query validation, and result
+processing with comprehensive error handling and type safety.
 """
 
 import argparse
 import csv
+import json
+import os
 import re
 import sys
 import time
-import json
-import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set
+from typing import Dict, List, Optional, Set, Union, Any, Iterator, Tuple
 from xml.etree import ElementTree as ET
 
 try:
     from Bio import Entrez
     import requests
 except ImportError as e:
-    print(f"Error: Required package not found: {e}")
-    print("Please install required packages: pip install biopython requests")
+    print(f"ERROR: Required package not found: {e}")
+    print("Please install required packages: poetry install")
     sys.exit(1)
+
+from .models import (
+    ApiSource, AuthorInfo, PaperInfo, CompanyCacheData, QueryAnalysis,
+    CompanyStats, SearchConfig, ApiError, QueryValidationError, CompanyDataError
+)
+from .logging_config import get_logger
+
+
+# Constants
+DEFAULT_CACHE_FILE = "pharma_companies_cache.json"
+CACHE_EXPIRY_DAYS = 7
+API_TIMEOUT = 30
+BATCH_SIZE = 10
+API_DELAY = 0.5
+MAX_RETRIES = 3
 
 
 class CompanyDataFetcher:
     """Fetches pharmaceutical and biotech company data from various APIs."""
     
-    def __init__(self, cache_file: str = "pharma_companies_cache.json", debug: bool = False):
+    def __init__(self, cache_file: str = DEFAULT_CACHE_FILE, debug: bool = False) -> None:
+        """
+        Initialize the company data fetcher.
+        
+        Args:
+            cache_file: Path to the cache file for storing company data
+            debug: Enable debug mode for verbose logging
+        """
         self.cache_file = cache_file
         self.debug = debug
-        self.cache_expiry_days = 7  # Cache expires after 7 days
+        self.cache_expiry_days = CACHE_EXPIRY_DAYS
+        self.logger = get_logger(__name__, debug_mode=debug)
         
-    def _debug_print(self, message: str):
-        """Print debug information if debug mode is enabled."""
-        if self.debug:
-            print(f"API DEBUG: {message}")
+    def _debug_print(self, message: str) -> None:
+        """
+        Print debug message if debug mode is enabled.
+        
+        Args:
+            message: Debug message to print
+        """
+        self.logger.debug(message)
     
-    def _load_cache(self) -> Dict:
-        """Load cached company data."""
+    def _load_cache(self) -> CompanyCacheData:
+        """
+        Load cached company data from file.
+        
+        Returns:
+            CompanyCacheData object with cached companies and metadata
+        """
         if not os.path.exists(self.cache_file):
-            return {"companies": set(), "last_updated": None}
+            return CompanyCacheData(companies=set(), last_updated=None)
         
         try:
             with open(self.cache_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Convert list back to set
-                data["companies"] = set(data.get("companies", []))
-                return data
-        except Exception as e:
-            self._debug_print(f"Error loading cache: {e}")
-            return {"companies": set(), "last_updated": None}
+                # Convert list back to set for performance
+                companies = set(data.get("companies", []))
+                last_updated = data.get("last_updated")
+                sources_used = [ApiSource(s) for s in data.get("sources_used", [])]
+                
+                return CompanyCacheData(
+                    companies=companies,
+                    last_updated=last_updated,
+                    sources_used=sources_used
+                )
+        except (json.JSONDecodeError, ValueError, IOError) as e:
+            self.logger.warning(f"Failed to load cache: {e}")
+            return CompanyCacheData(companies=set(), last_updated=None)
     
-    def _save_cache(self, companies: Set[str]):
-        """Save company data to cache."""
+    def _save_cache(self, companies: Set[str], sources_used: List[ApiSource]) -> None:
+        """
+        Save company data to cache file.
+        
+        Args:
+            companies: Set of company names to cache
+            sources_used: List of API sources used to fetch the data
+            
+        Raises:
+            CompanyDataError: If cache file cannot be written
+        """
         try:
+            cache_data = CompanyCacheData(
+                companies=companies,
+                last_updated=datetime.now().isoformat(),
+                sources_used=sources_used
+            )
+            
             data = {
                 "companies": list(companies),  # Convert set to list for JSON
-                "last_updated": datetime.now().isoformat()
+                "last_updated": cache_data.last_updated,
+                "sources_used": [source.value for source in sources_used]
             }
+            
             with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            self._debug_print(f"Cached {len(companies)} companies to {self.cache_file}")
-        except Exception as e:
-            self._debug_print(f"Error saving cache: {e}")
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                
+            self.logger.info(f"Cached {len(companies)} companies to {self.cache_file}")
+            
+        except (IOError, OSError) as e:
+            raise CompanyDataError(f"Failed to save cache to {self.cache_file}: {e}") from e
     
-    def _is_cache_valid(self, last_updated: str) -> bool:
-        """Check if cache is still valid."""
+    def _is_cache_valid(self, last_updated: Optional[str]) -> bool:
+        """
+        Check if cache is still valid based on expiry time.
+        
+        Args:
+            last_updated: ISO format timestamp of last cache update
+            
+        Returns:
+            True if cache is valid, False otherwise
+        """
         if not last_updated:
             return False
         
@@ -76,15 +144,24 @@ class CompanyDataFetcher:
             cache_date = datetime.fromisoformat(last_updated)
             expiry_date = cache_date + timedelta(days=self.cache_expiry_days)
             return datetime.now() < expiry_date
-        except Exception:
+        except ValueError:
+            self.logger.warning(f"Invalid timestamp in cache: {last_updated}")
             return False
     
     def fetch_from_clinicaltrials_gov(self) -> Set[str]:
-        """Fetch pharmaceutical companies from ClinicalTrials.gov API."""
+        """
+        Fetch pharmaceutical companies from ClinicalTrials.gov API.
+        
+        Returns:
+            Set of company names from clinical trial sponsors
+            
+        Raises:
+            ApiError: If API request fails
+        """
         companies = set()
         
         try:
-            self._debug_print("Fetching from ClinicalTrials.gov API...")
+            self.logger.info("Fetching company data from ClinicalTrials.gov API")
             
             # Search for studies with pharmaceutical sponsors
             params = {
@@ -98,39 +175,53 @@ class CompanyDataFetcher:
             response = requests.get(
                 'https://clinicaltrials.gov/api/query/study_fields',
                 params=params,
-                timeout=30
+                timeout=API_TIMEOUT
             )
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                data = response.json()
-                studies = data.get('StudyFieldsResponse', {}).get('StudyFields', [])
-                
-                for study in studies:
-                    # Extract lead sponsor
-                    lead_sponsors = study.get('LeadSponsorName', [])
-                    for sponsor in lead_sponsors:
-                        if sponsor and self._is_pharma_biotech_name(sponsor):
-                            companies.add(sponsor.lower().strip())
-                    
-                    # Extract collaborators
-                    collaborators = study.get('CollaboratorName', [])
-                    for collaborator in collaborators:
-                        if collaborator and self._is_pharma_biotech_name(collaborator):
-                            companies.add(collaborator.lower().strip())
-                
-                self._debug_print(f"Found {len(companies)} companies from ClinicalTrials.gov")
+            data = response.json()
+            studies = data.get('StudyFieldsResponse', {}).get('StudyFields', [])
             
-        except Exception as e:
-            self._debug_print(f"Error fetching from ClinicalTrials.gov: {e}")
+            for study in studies:
+                # Extract lead sponsor
+                lead_sponsors = study.get('LeadSponsorName', [])
+                for sponsor in lead_sponsors:
+                    if sponsor and self._is_pharma_biotech_name(sponsor):
+                        companies.add(sponsor.lower().strip())
+                
+                # Extract collaborators
+                collaborators = study.get('CollaboratorName', [])
+                for collaborator in collaborators:
+                    if collaborator and self._is_pharma_biotech_name(collaborator):
+                        companies.add(collaborator.lower().strip())
+            
+            self.logger.info(f"Found {len(companies)} companies from ClinicalTrials.gov")
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to fetch data from ClinicalTrials.gov API: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.CLINICAL_TRIALS) from e
+        except (json.JSONDecodeError, KeyError) as e:
+            error_msg = f"Failed to parse ClinicalTrials.gov API response: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.CLINICAL_TRIALS) from e
         
         return companies
     
     def fetch_from_openfda(self) -> Set[str]:
-        """Fetch pharmaceutical companies from OpenFDA API."""
+        """
+        Fetch pharmaceutical companies from OpenFDA API.
+        
+        Returns:
+            Set of company names from drug manufacturers
+            
+        Raises:
+            ApiError: If API request fails
+        """
         companies = set()
         
         try:
-            self._debug_print("Fetching from OpenFDA API...")
+            self.logger.info("Fetching company data from OpenFDA API")
             
             # Search drug manufacturers
             url = "https://api.fda.gov/drug/label.json"
@@ -140,30 +231,44 @@ class CompanyDataFetcher:
                 'limit': 1000
             }
             
-            response = requests.get(url, params=params, timeout=30)
+            response = requests.get(url, params=params, timeout=API_TIMEOUT)
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get('results', [])
-                
-                for result in results:
-                    manufacturer = result.get('term', '')
-                    if manufacturer and self._is_pharma_biotech_name(manufacturer):
-                        companies.add(manufacturer.lower().strip())
-                
-                self._debug_print(f"Found {len(companies)} companies from OpenFDA")
+            data = response.json()
+            results = data.get('results', [])
             
-        except Exception as e:
-            self._debug_print(f"Error fetching from OpenFDA: {e}")
+            for result in results:
+                manufacturer = result.get('term', '')
+                if manufacturer and self._is_pharma_biotech_name(manufacturer):
+                    companies.add(manufacturer.lower().strip())
+            
+            self.logger.info(f"Found {len(companies)} companies from OpenFDA")
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to fetch data from OpenFDA API: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.OPENFDA) from e
+        except (json.JSONDecodeError, KeyError) as e:
+            error_msg = f"Failed to parse OpenFDA API response: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.OPENFDA) from e
         
         return companies
     
     def fetch_from_wikidata(self) -> Set[str]:
-        """Fetch pharmaceutical companies from Wikidata SPARQL endpoint."""
+        """
+        Fetch pharmaceutical companies from Wikidata SPARQL endpoint.
+        
+        Returns:
+            Set of company names from Wikidata pharmaceutical companies
+            
+        Raises:
+            ApiError: If API request fails
+        """
         companies = set()
         
         try:
-            self._debug_print("Fetching from Wikidata...")
+            self.logger.info("Fetching company data from Wikidata SPARQL endpoint")
             
             # SPARQL query for pharmaceutical companies
             sparql_query = """
@@ -185,22 +290,28 @@ class CompanyDataFetcher:
                 url,
                 params={'query': sparql_query, 'format': 'json'},
                 headers=headers,
-                timeout=30
+                timeout=API_TIMEOUT
             )
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                data = response.json()
-                bindings = data.get('results', {}).get('bindings', [])
-                
-                for binding in bindings:
-                    company_name = binding.get('companyLabel', {}).get('value', '')
-                    if company_name:
-                        companies.add(company_name.lower().strip())
-                
-                self._debug_print(f"Found {len(companies)} companies from Wikidata")
+            data = response.json()
+            bindings = data.get('results', {}).get('bindings', [])
             
-        except Exception as e:
-            self._debug_print(f"Error fetching from Wikidata: {e}")
+            for binding in bindings:
+                company_name = binding.get('companyLabel', {}).get('value', '')
+                if company_name:
+                    companies.add(company_name.lower().strip())
+            
+            self.logger.info(f"Found {len(companies)} companies from Wikidata")
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Failed to fetch data from Wikidata: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.WIKIDATA) from e
+        except (json.JSONDecodeError, KeyError) as e:
+            error_msg = f"Failed to parse Wikidata response: {e}"
+            self.logger.error(error_msg)
+            raise ApiError(error_msg, ApiSource.WIKIDATA) from e
         
         return companies
     
@@ -310,123 +421,248 @@ class CompanyDataFetcher:
         }
     
     def fetch_all_companies(self, force_refresh: bool = False) -> Set[str]:
-        """Fetch companies from all sources with caching."""
+        """
+        Fetch companies from all sources with intelligent caching.
+        
+        Args:
+            force_refresh: If True, ignore cache and fetch fresh data
+            
+        Returns:
+            Set of pharmaceutical/biotech company names
+            
+        Raises:
+            CompanyDataError: If all API sources fail
+        """
         # Check cache first
         if not force_refresh:
             cached_data = self._load_cache()
-            if cached_data["companies"] and self._is_cache_valid(cached_data["last_updated"]):
-                self._debug_print(f"Using cached data with {len(cached_data['companies'])} companies")
-                return cached_data["companies"]
+            if cached_data.companies and self._is_cache_valid(cached_data.last_updated):
+                self.logger.info(f"Using cached data with {len(cached_data.companies)} companies")
+                return cached_data.companies
         
-        self._debug_print("Fetching fresh company data from APIs...")
+        self.logger.info("Fetching fresh company data from all API sources")
         
         # Start with hardcoded companies as fallback
         all_companies = self.get_hardcoded_companies()
         initial_count = len(all_companies)
+        sources_used = [ApiSource.HARDCODED]
         
-        # Fetch from APIs
+        # Fetch from APIs with proper error handling
         api_sources = [
-            self.fetch_from_clinicaltrials_gov,
-            self.fetch_from_openfda,
-            self.fetch_from_wikidata
+            (self.fetch_from_clinicaltrials_gov, ApiSource.CLINICAL_TRIALS),
+            (self.fetch_from_openfda, ApiSource.OPENFDA),
+            (self.fetch_from_wikidata, ApiSource.WIKIDATA)
         ]
         
-        for fetch_func in api_sources:
+        successful_sources = []
+        for fetch_func, source in api_sources:
             try:
                 companies = fetch_func()
                 all_companies.update(companies)
-                self._debug_print(f"Total companies after {fetch_func.__name__}: {len(all_companies)}")
+                sources_used.append(source)
+                successful_sources.append(fetch_func.__name__)
+                self.logger.debug(f"Total companies after {fetch_func.__name__}: {len(all_companies)}")
+            except ApiError as e:
+                self.logger.warning(f"Failed to fetch from {source.value}: {e}")
             except Exception as e:
-                self._debug_print(f"Error in {fetch_func.__name__}: {e}")
+                self.logger.error(f"Unexpected error in {fetch_func.__name__}: {e}")
+        
+        if not successful_sources:
+            self.logger.warning("All API sources failed, using only hardcoded companies")
         
         # Add variations and clean up
+        expanded_companies = self._expand_company_names(all_companies)
+        
+        self.logger.info(f"Expanded from {initial_count} to {len(expanded_companies)} companies")
+        
+        # Save to cache
+        try:
+            self._save_cache(expanded_companies, sources_used)
+        except CompanyDataError as e:
+            self.logger.warning(f"Failed to save cache: {e}")
+        
+        return expanded_companies
+    
+    def _expand_company_names(self, companies: Set[str]) -> Set[str]:
+        """
+        Expand company names with common variations and abbreviations.
+        
+        Args:
+            companies: Original set of company names
+            
+        Returns:
+            Expanded set with variations
+        """
         expanded_companies = set()
-        for company in all_companies:
+        for company in companies:
             expanded_companies.add(company.lower())
             # Add common abbreviations and variations
             if "pharmaceuticals" in company:
                 expanded_companies.add(company.replace("pharmaceuticals", "pharma").lower())
             if "biotechnology" in company:
                 expanded_companies.add(company.replace("biotechnology", "biotech").lower())
-        
-        self._debug_print(f"Expanded from {initial_count} to {len(expanded_companies)} companies")
-        
-        # Save to cache
-        self._save_cache(expanded_companies)
+            if "laboratories" in company:
+                expanded_companies.add(company.replace("laboratories", "labs").lower())
         
         return expanded_companies
 
-    def clean_and_rebuild_cache(self):
-        """Clean the cache and rebuild with improved filtering."""
-        self._debug_print("Cleaning and rebuilding company cache...")
+    def clean_and_rebuild_cache(self) -> Set[str]:
+        """
+        Clean the cache and rebuild with improved filtering.
+        
+        Returns:
+            Set of cleaned company names
+            
+        Raises:
+            CompanyDataError: If cache cannot be rebuilt
+        """
+        self.logger.info("Cleaning and rebuilding company cache with improved filtering")
         
         # Remove old cache file
         if os.path.exists(self.cache_file):
-            os.remove(self.cache_file)
-            self._debug_print("Removed old cache file")
+            try:
+                os.remove(self.cache_file)
+                self.logger.info("Removed old cache file")
+            except OSError as e:
+                raise CompanyDataError(f"Failed to remove old cache file: {e}") from e
         
         # Fetch fresh data with improved filtering
         companies = self.fetch_all_companies(force_refresh=True)
         
-        # Additional cleanup pass
+        # Additional cleanup pass with stricter filtering
         cleaned_companies = set()
         for company in companies:
-            # More aggressive filtering
-            if (len(company) >= 3 and 
-                not re.match(r'^[a-z0-9_\-]{8,}$', company) and  # No random IDs
-                not re.search(r'\d{4,}', company) and            # No long numbers
-                ' ' in company or any(keyword in company for keyword in ['pharma', 'biotech', 'therapeutic', 'lab'])): # Has space or key terms
+            if self._is_valid_company_name(company):
                 cleaned_companies.add(company)
         
-        self._debug_print(f"Cleaned {len(companies)} down to {len(cleaned_companies)} companies")
+        self.logger.info(f"Cleaned {len(companies)} down to {len(cleaned_companies)} companies")
         
-        # Save cleaned data
-        self._save_cache(cleaned_companies)
         return cleaned_companies
+    
+    def _is_valid_company_name(self, company: str) -> bool:
+        """
+        Validate if a company name meets quality criteria.
+        
+        Args:
+            company: Company name to validate
+            
+        Returns:
+            True if the company name is valid
+        """
+        if len(company) < 3:
+            return False
+            
+        # Exclude random IDs and technical terms
+        if re.match(r'^[a-z0-9_\-]{8,}$', company):  # No random IDs
+            return False
+        if re.search(r'\d{4,}', company):  # No long numbers
+            return False
+            
+        # Must have space or pharmaceutical keywords
+        has_space = ' ' in company
+        has_keywords = any(keyword in company for keyword in 
+                          ['pharma', 'biotech', 'therapeutic', 'lab', 'medicine', 'clinical'])
+        
+        return has_space or has_keywords
 
 
 class PubMedPharmaSearch:
-    """Class to handle PubMed searches for pharmaceutical/biotech company papers."""
+    """
+    Handles PubMed searches for pharmaceutical/biotech company papers.
     
-    def __init__(self, email: str = "user@example.com", debug: bool = False, use_hardcoded_only: bool = False):
-        """Initialize the search tool."""
+    This class provides comprehensive functionality to search PubMed for research
+    papers and identify those with at least one author affiliated with 
+    pharmaceutical or biotech companies.
+    """
+    
+    def __init__(
+        self, 
+        email: str = "user@example.com", 
+        debug: bool = False, 
+        use_hardcoded_only: bool = False
+    ) -> None:
+        """
+        Initialize the PubMed pharmaceutical search tool.
+        
+        Args:
+            email: Email address for PubMed API requests
+            debug: Enable debug mode for verbose logging
+            use_hardcoded_only: Use only hardcoded company list (skip API fetching)
+            
+        Raises:
+            CompanyDataError: If company data cannot be loaded
+        """
         Entrez.email = email
         self.debug = debug
+        self.logger = get_logger(__name__, debug_mode=debug)
         
         # Initialize company data fetcher
         self.company_fetcher = CompanyDataFetcher(debug=debug)
         
-        if use_hardcoded_only:
-            self.pharma_biotech_companies = self.company_fetcher.get_hardcoded_companies()
-            if self.debug:
-                print(f"DEBUG: Using hardcoded company list with {len(self.pharma_biotech_companies)} companies")
-        else:
-            self.pharma_biotech_companies = self.company_fetcher.fetch_all_companies()
-            if self.debug:
-                print(f"DEBUG: Loaded {len(self.pharma_biotech_companies)} pharmaceutical/biotech companies from APIs")
+        try:
+            if use_hardcoded_only:
+                self.pharma_biotech_companies = self.company_fetcher.get_hardcoded_companies()
+                self.logger.info(f"Using hardcoded company list with {len(self.pharma_biotech_companies)} companies")
+            else:
+                self.pharma_biotech_companies = self.company_fetcher.fetch_all_companies()
+                self.logger.info(f"Loaded {len(self.pharma_biotech_companies)} pharmaceutical/biotech companies")
+        except Exception as e:
+            raise CompanyDataError(f"Failed to load company data: {e}") from e
     
-    def _debug_print(self, message: str):
-        """Print debug information if debug mode is enabled."""
-        if self.debug:
-            print(f"DEBUG: {message}")
-    
-    def update_company_database(self):
-        """Force update of the company database from APIs."""
-        self._debug_print("Forcing company database refresh...")
-        self.pharma_biotech_companies = self.company_fetcher.fetch_all_companies(force_refresh=True)
-        self._debug_print(f"Updated company database with {len(self.pharma_biotech_companies)} companies")
+    def _debug_print(self, message: str) -> None:
+        """
+        Print debug information if debug mode is enabled.
         
-    def get_company_stats(self) -> Dict:
-        """Get statistics about the company database."""
+        Args:
+            message: Debug message to print
+        """
+        self.logger.debug(message)
+    
+    def update_company_database(self) -> None:
+        """
+        Force update of the company database from APIs.
+        
+        Raises:
+            CompanyDataError: If company database cannot be updated
+        """
+        self.logger.info("Forcing company database refresh from all API sources")
+        try:
+            self.pharma_biotech_companies = self.company_fetcher.fetch_all_companies(force_refresh=True)
+            self.logger.info(f"Updated company database with {len(self.pharma_biotech_companies)} companies")
+        except Exception as e:
+            raise CompanyDataError(f"Failed to update company database: {e}") from e
+    
+    def get_company_stats(self) -> CompanyStats:
+        """
+        Get comprehensive statistics about the company database.
+        
+        Returns:
+            Dictionary containing company database statistics
+        """
+        cached_data = self.company_fetcher._load_cache()
+        
         return {
             "total_companies": len(self.pharma_biotech_companies),
             "cache_file": self.company_fetcher.cache_file,
-            "sample_companies": list(self.pharma_biotech_companies)[:10]
+            "sample_companies": list(self.pharma_biotech_companies)[:10],
+            "sources_used": [source.value for source in cached_data.sources_used] if cached_data.sources_used else [],
+            "last_updated": cached_data.last_updated
         }
     
-    def validate_query_syntax(self, query: str) -> Dict:
-        """Validate and analyze PubMed query syntax."""
-        analysis = {
+    def validate_query_syntax(self, query: str) -> QueryAnalysis:
+        """
+        Validate and analyze PubMed query syntax.
+        
+        Args:
+            query: PubMed query string to validate
+            
+        Returns:
+            QueryAnalysis object containing validation results and component breakdown
+            
+        Raises:
+            QueryValidationError: If query contains critical syntax errors
+        """
+        analysis: QueryAnalysis = {
             'query': query,
             'valid': True,
             'warnings': [],
@@ -439,6 +675,9 @@ class PubMedPharmaSearch:
                 'mesh_terms': []
             }
         }
+        
+        if not query or not query.strip():
+            raise QueryValidationError("Query cannot be empty")
         
         # Find Boolean operators
         boolean_ops = re.findall(r'\b(AND|OR|NOT)\b', query, re.IGNORECASE)
@@ -496,10 +735,10 @@ class PubMedPharmaSearch:
         
         return analysis
     
-    def print_query_help(self):
+    def print_query_help(self) -> None:
         """Print comprehensive PubMed query syntax help."""
         help_text = """
-🔹 COMPLETE PUBMED QUERY SYNTAX GUIDE 🔹
+COMPLETE PUBMED QUERY SYNTAX GUIDE
 
 1. BOOLEAN OPERATORS (case-insensitive but uppercase recommended):
    AND  - Both terms must be present
@@ -594,7 +833,13 @@ class PubMedPharmaSearch:
    - Escape special characters if needed
    - Be careful with punctuation in company names
 
+10. EXAMPLE COMMANDS:
+    python pubmed_pharma_search.py "cancer drug discovery"
+    python pubmed_pharma_search.py "CRISPR therapeutics" -f results.csv -d
+    python pubmed_pharma_search.py "COVID-19[MeSH] AND vaccine" -f covid_pharma.csv
+    python pubmed_pharma_search.py "(cancer[ti] OR tumor[ti]) AND drug discovery[tiab]" -f cancer_drugs.csv
 
+For more information, visit: https://pubmed.ncbi.nlm.nih.gov/help/
         """
         print(help_text)
     
@@ -677,7 +922,7 @@ class PubMedPharmaSearch:
         papers = []
         
         # Process PMIDs in batches to avoid overwhelming the API
-        batch_size = 10
+        batch_size = BATCH_SIZE
         for i in range(0, len(pmids), batch_size):
             batch_pmids = pmids[i:i + batch_size]
             self._debug_print(f"Processing batch {i//batch_size + 1}/{(len(pmids)-1)//batch_size + 1}")
@@ -700,7 +945,7 @@ class PubMedPharmaSearch:
                         papers.append(paper_info)
                 
                 # Be respectful to the API
-                time.sleep(0.5)
+                time.sleep(API_DELAY)
                 
             except Exception as e:
                 self._debug_print(f"Error fetching batch: {e}")
@@ -1067,7 +1312,7 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
         stats = searcher.get_company_stats()
-        print("\n📊 PHARMACEUTICAL/BIOTECH COMPANY DATABASE STATISTICS")
+        print("\nPHARMACEUTICAL/BIOTECH COMPANY DATABASE STATISTICS")
         print("="*60)
         print(f"Total companies in database: {stats['total_companies']:,}")
         print(f"Cache file location: {stats['cache_file']}")
@@ -1075,24 +1320,24 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         print(f"\nSample companies (first 10):")
         for i, company in enumerate(stats['sample_companies'][:10], 1):
             print(f"  {i:2d}. {company}")
-        print(f"\n💡 Use --update-companies to refresh from APIs")
+        print(f"\n Use --update-companies to refresh from APIs")
         return
     
     if args.update_companies:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
-        print("🔄 Updating pharmaceutical/biotech company database...")
+        print(" Updating pharmaceutical/biotech company database...")
         searcher.update_company_database()
         stats = searcher.get_company_stats()
-        print(f"✅ Updated! Now tracking {stats['total_companies']:,} companies")
+        print(f" Updated! Now tracking {stats['total_companies']:,} companies")
         return
     
     if args.clean_company_cache:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
-        print("🔄 Cleaning and rebuilding company cache...")
+        print(" Cleaning and rebuilding company cache...")
         searcher.company_fetcher.clean_and_rebuild_cache()
-        print("✅ Cache rebuilt!")
+        print(" Cache rebuilt!")
         return
     
     # Check if query is provided when needed
@@ -1107,41 +1352,45 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
     if args.validate_query:
         if not args.query:
             parser.error("Query is required for validation")
-        analysis = searcher.validate_query_syntax(args.query)
-        print(f"\n🔍 QUERY ANALYSIS FOR: {args.query}\n")
-        print(f"Valid syntax: {'✅ YES' if analysis['valid'] else '❌ NO'}")
-        
-        if analysis['warnings']:
-            print(f"\n⚠️ Warnings:")
-            for warning in analysis['warnings']:
-                print(f"  - {warning}")
-        
-        print(f"\n📊 Query Components:")
-        components = analysis['components']
-        
-        if components['boolean_operators']:
-            print(f"  Boolean operators: {', '.join(components['boolean_operators'])}")
-        
-        if components['field_tags']:
-            print(f"  Field tags: {', '.join([f'[{tag}]' for tag in components['field_tags']])}")
-        
-        if components['phrases']:
-            phrases_str = ', '.join(['"' + phrase + '"' for phrase in components['phrases']])
-            print(f"  Quoted phrases: {phrases_str}")
-        
-        if components['wildcards']:
-            print(f"  Wildcards: {', '.join(components['wildcards'])}")
-        
-        if components['date_filters']:
-            print(f"  Date filters: {', '.join(components['date_filters'])}")
-        
-        if components['mesh_terms']:
-            print(f"  MeSH terms: {', '.join(components['mesh_terms'])}")
-        
-        if not any(components.values()):
-            print("  Simple keyword search (no advanced syntax detected)")
-        
-        print(f"\n💡 This query will be processed by PubMed's search engine.")
+        try:
+            analysis = searcher.validate_query_syntax(args.query)
+            print(f"\n QUERY ANALYSIS FOR: {args.query}\n")
+            print(f"Valid syntax: {'YES' if analysis['valid'] else ' NO'}")
+            
+            if analysis['warnings']:
+                print(f"\n Warnings:")
+                for warning in analysis['warnings']:
+                    print(f"  - {warning}")
+            
+            print(f"\n Query Components:")
+            components = analysis['components']
+            
+            if components['boolean_operators']:
+                print(f"  Boolean operators: {', '.join(components['boolean_operators'])}")
+            
+            if components['field_tags']:
+                print(f"  Field tags: {', '.join([f'[{tag}]' for tag in components['field_tags']])}")
+            
+            if components['phrases']:
+                phrases_str = ', '.join(['"' + phrase + '"' for phrase in components['phrases']])
+                print(f"  Quoted phrases: {phrases_str}")
+            
+            if components['wildcards']:
+                print(f"  Wildcards: {', '.join(components['wildcards'])}")
+            
+            if components['date_filters']:
+                print(f"  Date filters: {', '.join(components['date_filters'])}")
+            
+            if components['mesh_terms']:
+                print(f"  MeSH terms: {', '.join(components['mesh_terms'])}")
+            
+            if not any(components.values()):
+                print("  Simple keyword search (no advanced syntax detected)")
+            
+            print(f"\n This query will be processed by PubMed's search engine.")
+        except QueryValidationError as e:
+            print(f"\n Query validation failed: {e}")
+            sys.exit(1)
         return
     
     try:

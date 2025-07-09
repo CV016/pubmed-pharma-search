@@ -1067,7 +1067,7 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
         stats = searcher.get_company_stats()
-        print("\n📊 PHARMACEUTICAL/BIOTECH COMPANY DATABASE STATISTICS")
+        print("\nPHARMACEUTICAL/BIOTECH COMPANY DATABASE STATISTICS")
         print("="*60)
         print(f"Total companies in database: {stats['total_companies']:,}")
         print(f"Cache file location: {stats['cache_file']}")
@@ -1075,24 +1075,24 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         print(f"\nSample companies (first 10):")
         for i, company in enumerate(stats['sample_companies'][:10], 1):
             print(f"  {i:2d}. {company}")
-        print(f"\n💡 Use --update-companies to refresh from APIs")
+        print(f"\n Use --update-companies to refresh from APIs")
         return
     
     if args.update_companies:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
-        print("🔄 Updating pharmaceutical/biotech company database...")
+        print(" Updating pharmaceutical/biotech company database...")
         searcher.update_company_database()
         stats = searcher.get_company_stats()
-        print(f"✅ Updated! Now tracking {stats['total_companies']:,} companies")
+        print(f" Updated! Now tracking {stats['total_companies']:,} companies")
         return
     
     if args.clean_company_cache:
         searcher = PubMedPharmaSearch(email=args.email, debug=args.debug, 
                                     use_hardcoded_only=args.use_hardcoded_only)
-        print("🔄 Cleaning and rebuilding company cache...")
+        print(" Cleaning and rebuilding company cache...")
         searcher.company_fetcher.clean_and_rebuild_cache()
-        print("✅ Cache rebuilt!")
+        print(" Cache rebuilt!")
         return
     
     # Check if query is provided when needed
@@ -1108,15 +1108,15 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         if not args.query:
             parser.error("Query is required for validation")
         analysis = searcher.validate_query_syntax(args.query)
-        print(f"\n🔍 QUERY ANALYSIS FOR: {args.query}\n")
-        print(f"Valid syntax: {'✅ YES' if analysis['valid'] else '❌ NO'}")
+        print(f"\n QUERY ANALYSIS FOR: {args.query}\n")
+        print(f"Valid syntax: {' YES' if analysis['valid'] else ' NO'}")
         
         if analysis['warnings']:
-            print(f"\n⚠️ Warnings:")
+            print(f"\n Warnings:")
             for warning in analysis['warnings']:
                 print(f"  - {warning}")
         
-        print(f"\n📊 Query Components:")
+        print(f"\n Query Components:")
         components = analysis['components']
         
         if components['boolean_operators']:
@@ -1141,7 +1141,7 @@ PUBMED QUERY SYNTAX - ALL FEATURES SUPPORTED:
         if not any(components.values()):
             print("  Simple keyword search (no advanced syntax detected)")
         
-        print(f"\n💡 This query will be processed by PubMed's search engine.")
+        print(f"\n This query will be processed by PubMed's search engine.")
         return
     
     try:
